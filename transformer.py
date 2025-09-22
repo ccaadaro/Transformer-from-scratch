@@ -1,9 +1,17 @@
 import math
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import random
+
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message=".*CUDA initialization.*")
+    CUDA_AVAILABLE = torch.cuda.is_available()
+
+DEVICE = torch.device("cuda" if CUDA_AVAILABLE else "cpu")
 
 # ===== Dataset =====
 class DummyTranslationDataset(Dataset):
@@ -41,8 +49,13 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
         # Expand mask to match scores dimensions
         if mask.dim() == 4:  # (B, 1, 1, S) or (B, 1, T, T)
             mask = mask.expand(scores.size(0), scores.size(1), scores.size(2), scores.size(3))
-        scores = scores.masked_fill(mask == 0, float('-inf'))
+        mask = mask.to(dtype=scores.dtype)
+        scores = scores.masked_fill(mask == 0, -1e9)
     attn = F.softmax(scores, dim=-1)
+    if mask is not None:
+        attn = attn * mask
+        attn_sum = attn.sum(dim=-1, keepdim=True)
+        attn = attn / (attn_sum + torch.finfo(attn.dtype).eps)
     return torch.matmul(attn, V), attn
 
 class MultiHeadAttention(nn.Module):
@@ -100,17 +113,27 @@ class DecoderLayer(nn.Module):
         self.self_attn = MultiHeadAttention(d_model, num_heads)
         self.cross_attn = MultiHeadAttention(d_model, num_heads)
         self.ff = FeedForward(d_model, d_ff, dropout)
+
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
+
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
 
-    def forward(self, x, enc_out, src_mask=None, tgt_mask=None):
-        x = self.norm1(x + self.dropout1(self.self_attn(x, x, x, tgt_mask)))
-        x = self.norm2(x + self.dropout2(self.cross_attn(x, enc_out, enc_out, src_mask)))
-        return self.norm3(x + self.dropout3(self.ff(x)))
+    def forward(self, x, memory, memory_mask=None, tgt_mask=None):
+        # masked self-attention (causal)
+        sa = self.self_attn(x, x, x, tgt_mask)
+        x = self.norm1(x + self.dropout1(sa))
+        # cross-attention (encoder->decoder)
+        ca = self.cross_attn(x, memory, memory, memory_mask)
+        x = self.norm2(x + self.dropout2(ca))
+        # feed-forward
+        ff = self.ff(x)
+        x = self.norm3(x + self.dropout3(ff))
+        return x
+
 
 # ===== Transformer Model =====
 class Transformer(nn.Module):
@@ -137,7 +160,7 @@ def create_mask(src, tgt):
     src_mask = (src != 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
     tgt_pad_mask = (tgt != 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
     tgt_len = tgt.size(1)
-    tgt_sub_mask = torch.tril(torch.ones((tgt_len, tgt_len))).bool().to(tgt.device)
+    tgt_sub_mask = torch.tril(torch.ones((tgt_len, tgt_len), device=tgt.device, dtype=torch.bool))
     tgt_mask = tgt_pad_mask & tgt_sub_mask
     return src_mask, tgt_mask
 
@@ -145,7 +168,7 @@ def create_mask(src, tgt):
 def train():
     dataset = DummyTranslationDataset()
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-    model = Transformer(1000, 1000).cuda()
+    model = Transformer(1000, 1000).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss(ignore_index=0)
 
@@ -153,7 +176,7 @@ def train():
         model.train()
         total_loss = 0
         for src, tgt in dataloader:
-            src, tgt = src.cuda(), tgt.cuda()
+            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
             tgt_input = tgt[:, :-1]
             tgt_output = tgt[:, 1:]
             src_mask, tgt_mask = create_mask(src, tgt_input)
@@ -169,7 +192,7 @@ def train():
         # Inference test
         model.eval()
         src, _ = dataset[0]
-        src = src.unsqueeze(0).cuda()
+        src = src.unsqueeze(0).to(DEVICE)
         src_mask, _ = create_mask(src, src)
         output = greedy_decode(model, src, src_mask)
         print(f"Source: {src.squeeze().tolist()}")
@@ -177,7 +200,7 @@ def train():
 
 def greedy_decode(model, src, src_mask, max_len=10, start_symbol=1):
     memory = src
-    ys = torch.ones(src.size(0), 1).fill_(start_symbol).type_as(src)  # start token
+    ys = torch.full((src.size(0), 1), start_symbol, dtype=src.dtype, device=src.device)
     for i in range(max_len - 1):
         tgt_mask = create_mask(src, ys)[1]
         out = model(src, ys, src_mask, tgt_mask)
@@ -260,7 +283,7 @@ def test_translation_model():
     
     # Smaller model for testing
     model = Transformer(vocab_size, vocab_size, d_model=128, num_heads=4, 
-                       num_layers=2, d_ff=256, dropout=0.1).cuda()
+                       num_layers=2, d_ff=256, dropout=0.1).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     
@@ -270,7 +293,7 @@ def test_translation_model():
         model.train()
         total_loss = 0
         for src, tgt in dataloader:
-            src, tgt = src.cuda(), tgt.cuda()
+            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
             tgt_input = tgt[:, :-1]
             tgt_output = tgt[:, 1:]
             
@@ -303,7 +326,7 @@ def test_translation_model():
             src_tokens = text_to_tokens(sentence, vocab)
             src_padded = torch.zeros(10, dtype=torch.long)
             src_padded[:min(len(src_tokens), 10)] = src_tokens[:10]
-            src = src_padded.unsqueeze(0).cuda()
+            src = src_padded.unsqueeze(0).to(DEVICE)
             
             src_mask, _ = create_mask(src, src)
             output = greedy_decode_with_vocab(model, src, src_mask, vocab)
@@ -318,7 +341,7 @@ def greedy_decode_with_vocab(model, src, src_mask, vocab, max_len=10):
     start_symbol = vocab['<start>']
     end_symbol = vocab['<end>']
     
-    ys = torch.ones(src.size(0), 1).fill_(start_symbol).type_as(src)
+    ys = torch.full((src.size(0), 1), start_symbol, dtype=src.dtype, device=src.device)
     
     for i in range(max_len - 1):
         tgt_mask = create_mask(src, ys)[1]
@@ -326,9 +349,9 @@ def greedy_decode_with_vocab(model, src, src_mask, vocab, max_len=10):
         prob = out[:, -1, :]
         next_word = torch.argmax(prob, dim=-1).unsqueeze(1)
         ys = torch.cat([ys, next_word], dim=1)
-        
-        # Stop if end token is generated
-        if next_word.item() == end_symbol:
+
+        # Stop once all sequences emit the end token
+        if (next_word == end_symbol).all():
             break
     
     return ys
@@ -343,11 +366,11 @@ def test_attention_visualization():
     src_tokens = text_to_tokens(sentence, vocab)
     src_padded = torch.zeros(10, dtype=torch.long)
     src_padded[:len(src_tokens)] = src_tokens
-    src = src_padded.unsqueeze(0).cuda()
+    src = src_padded.unsqueeze(0).to(DEVICE)
     
     # Simple model
     model = Transformer(len(vocab), len(vocab), d_model=64, num_heads=2, 
-                       num_layers=1, d_ff=128).cuda()
+                       num_layers=1, d_ff=128).to(DEVICE)
     
     model.eval()
     with torch.no_grad():
@@ -374,7 +397,7 @@ def test_model_capacity():
     
     for i, config in enumerate(configs):
         print(f"\nConfiguration {i+1}: {config}")
-        model = Transformer(vocab_size, vocab_size, **config).cuda()
+        model = Transformer(vocab_size, vocab_size, **config).to(DEVICE)
         
         # Count parameters
         total_params = sum(p.numel() for p in model.parameters())
@@ -384,8 +407,8 @@ def test_model_capacity():
         print(f"Trainable parameters: {trainable_params:,}")
         
         # Speed test
-        src = torch.randint(1, vocab_size, (4, 10)).cuda()
-        tgt = torch.randint(1, vocab_size, (4, 10)).cuda()
+        src = torch.randint(1, vocab_size, (4, 10), device=DEVICE)
+        tgt = torch.randint(1, vocab_size, (4, 10), device=DEVICE)
         
         import time
         start_time = time.time()
@@ -397,26 +420,24 @@ def test_model_capacity():
         print(f"Time for 100 forward passes: {(end_time - start_time)*1000:.2f} ms")
 
 def run_all_tests():
-    """Execute all transformer tests"""
-    print("🚀 Starting Transformer Tests\n")
     
     # Test 1: Basic training with random data
-    print("1️⃣ Basic training with random data")
+    print("1Basic training with random data")
     train()
     
     # Test 2: Translation with real vocabulary
-    print("\n2️⃣ Translation test with real vocabulary")
+    print("\n2Translation test with real vocabulary")
     test_translation_model()
     
     # Test 3: Attention visualization
-    print("\n3️⃣ Attention visualization test")
+    print("\n3Attention visualization test")
     test_attention_visualization()
     
     # Test 4: Model capacity analysis
-    print("\n4️⃣ Model capacity analysis")
+    print("\n4Model capacity analysis")
     test_model_capacity()
     
-    print("\n✅ All tests completed!")
+    print("\nAll tests completed!")
 
 if __name__ == "__main__":
     run_all_tests()
